@@ -1,0 +1,129 @@
+#PRELIMINARIES. Make directory, change to it, and load plink. 
+module load plink/1.9
+plink
+ 
+#######################
+#P1. Import working IDs
+chmod +x M4PLUS2
+wc -l M4PLUS2
+17582 M4PLUS2
+
+#P2. I CAN NOW SUBSET MY SPARK DATA BASED ON THESE IDs. 
+plink
+plink --bfile alpha_omega_hg19_allchrs --keep M4PLUS2  --make-bed --out SPARK_data
+
+#########################################
+#I. QUALITY CONTROL ANALYSIS
+#SCRIPT 1A. Basic QC: Sex-checks
+plink --bfile SPARK_data --check-sex --out QC0
+
+#OUTCOME: No sex info available. 
+#Unable to produce homozygosity plot. 
+
+#2. Basic QC: Looking for Missing Data
+plink --bfile SPARK_data --missing --out QC1
+ 
+cp QC1.imiss /home/outdir
+cp QC1.lmiss /home/outdir
+ 
+#This gives you two files: QC1.imiss and QC1.lmiss, containing sample- and marker-based reports respectively. 
+#MOVE your QC1 files to RStudio and run section 2 of your code. (KIV 92% call rate threshold)
+###### R script: 
+# Load per-SNP missingness rates
+SPARK.QC1 <- read.table("QC1.lmiss", header=T)
+# Plot call rate
+SPARK.QC1$F_GENO <- 1 - SPARK.QC1$F_MISS # Invert missingness to create call rate (i.e. "completeness")
+SPARK.QC1 <- SPARK.QC1[order(SPARK.QC1$F_GENO),] # Order the samples by call rate for plot
+SPARK.QC1$Q <- (1:dim(SPARK.QC1)[1])/(dim(SPARK.QC1)[1]-1) # Assign each sample to its quantile for plot
+SPARK.QC1.p1 <- ggplot(SPARK.QC1, aes(x = Q, y= F_GENO)) +
+  geom_point(alpha = 1/10,size = 5) +
+  labs(title="",y="Call Rate",x="Quantile")
+SPARK.QC1.p1
+write.table(subset(SPARK.QC1,F_GENO < 0.92, select="SNP"), "QC1.badsnp", quote=F,col.names = F,row.names=F) 
+##########################
+#The script has created a QC1.badsnp file. move it into your CL and run the next code. 
+#count the bad snps, exclude them, then run the --missing command again.  
+wc -l QC1.badsnp
+
+plink --bfile SPARK_data --exclude QC1.badsnp --make-bed --out SPARK_data.afterQC1
+ 
+plink --bfile SPARK_data.afterQC1 --missing --out QC2
+
+#Move the QC2.imiss file into RStudio and run script 3. 
+############### R script: 
+# Load per-individual missingness rates
+SPARK.QC2 <- read.table("QC2.imiss", header=T)
+# Plot coverage
+SPARK.QC2$F_GENO <- 1 - SPARK.QC2$F_MISS # Invert missingness to create coverage
+SPARK.QC2 <- SPARK.QC2[order(SPARK.QC2$F_GENO),] # Order the samples by coverage for plot
+SPARK.QC2$Q <- (1:dim(SPARK.QC2)[1])/(dim(SPARK.QC2)[1]-1) # Assign each sample to its quantile for plot
+SPARK.QC2.p1 <- ggplot(SPARK.QC2, aes(x = Q, y= F_GENO)) +
+  geom_point(alpha = 1/10,size = 5)+
+  labs(title="",y="Coverage",x="Quantile")
+SPARK.QC2.p1
+write.table(subset(SPARK.QC2,F_GENO < 0.95, select=c("FID","IID")), "QC2.badids", quote=F,col.names = F,row.names=F) 
+#############################
+#You have a QC2.badids file. Move it your CL and remove them. 
+  
+#plink --bfile SPARK_data.afterQC1 --remove QC2.badids --make-bed --out SPARK_data.afterQC2
+ 
+#3. Advanced QC: removing sources of false positives
+ 
+#3.1 Heterozygosity
+ 
+#plink --bfile SPARK_data.afterQC1 --het --keep QC3.pcaids --out QC4
+#plink --bfile SPARK_data.afterQC2.r02 --het --out QC4
+##########R script: 
+# Load inbreeding (F coefficient) data
+SPARK.HET <- read.table("QC4.het", header=T)
+# Plot histogram
+SPARK.HET.p1 <- ggplot(SPARK.HET, aes(x = F)) +
+  geom_histogram(aes(y=..count..),binwidth=0.0001, colour="darkgreen", fill="white") +
+  labs(title="",y="Number of samples",x="Inbreeding coefficient",color="") 
+SPARK.HET.p1
+#########################################################
+#3.2 HWE
+
+plink --bfile SPARK_data.afterQC1 --hwe midp 10e-6 --make-bed --out SPARK_data_beforeLD.clean
+ 
+#Here is the file for GWAS and GREML. Endpoint: SPARK_data_beforeLD.clean 
+##########################################################################
+#4.Population structure
+#4.1 Prune the genotype data
+#SCRIPT 3A.
+ 
+#plink --bfile [SPARK_data.afterQC1] --indep-pairphase 50 5 0.2 --out [SPARK_data.r02]
+ 
+#4.2 Remove long-range LD regions 
+#RUN bash script 
+sh extract_SNPs_LRLDregions.sh
+ 
+ls
+wc -l longrangeLDregionSNPs.txt
+#check that you have a file labelled longrangeLDregionSNPs
+
+#plink --bfile [SPARK_data.afterQC1] --extract [SPARK_data.r02.prune.in] --exclude [longrangeLDregionSNPs.txt] --make-bed --out [SPARK_data.afterQC2.r02]
+ 
+#NEXT: KING AND GENESIS TO GENERATE PCs. 
+#####################################################################################
+#GWAS:
+# Load  and QQMAN libraries
+
+if(!require("qqman")) {install.packages('qqman', dep=T)}
+library(qqman)
+# Load association results
+GWAS <-  read.table("SPARK_data.gwas.assoc.logistic", header=T)
+GWAS <- na.omit(GWAS) # Remove SNPs in which regression failed and returned "NA" statistics
+# Calculate genomic inflation factor
+z = qnorm(GWAS$P / 2)
+lambda = round(median(z^2) / qchisq(0.5,1),3)
+lambda
+qq(GWAS$P)
+
+# Make Manhattan plot (uses a red line for genome-wide significance and a blue line for p < 1*10e-5)
+manhattan(GWAS)
+#################################################################################################################################
+
+
+
+ 
